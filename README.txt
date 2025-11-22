@@ -1,3 +1,5 @@
+IMPORTANT --> RUN THE .sh FILE, WITHOUT THAT THE "alive.txt" WON'T GENERATE!!!!
+
 This document breaks down the entire Python script at the deepest level, explaining every command, concept, structure, and interaction with the Linux network stack.
 
 -----------------------------------------------------
