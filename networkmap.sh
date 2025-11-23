@@ -37,4 +37,4 @@ fping_time=$((end_fping - start_fping))
 echo "[*] fping done. Time taken: ${fping_time} ms"
 
 # 5) Call Python
-python3.13 /home/bartmoss/network_terminal_tree_map/main.py
+python3.13 ~/networktree/main.py
