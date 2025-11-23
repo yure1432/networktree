@@ -2,8 +2,19 @@ import json
 import os
 import time
 import subprocess
+import shlex
 
 MEMORY_FILE = "devices.json"
+
+# simple in-process cache for vendor lookups
+_VENDOR_CACHE = {}
+_POSSIBLE_OUI_PATHS = [
+    "/usr/share/hwdata/oui.txt",
+    "/usr/share/misc/oui.txt",
+    "/usr/share/manuf",
+    "/var/lib/ieee-data/oui.txt",
+    "/usr/local/share/ieee-data/oui.txt",
+]
 
 
 # helper to run shell commands
@@ -14,17 +25,40 @@ def run(cmd: str) -> str:
         return ""
 
 
-# MAC vendor lookup
+# MAC vendor lookup (robust)
 def lookup_vendor(mac: str) -> str:
-    if not mac or mac == "unknown":
+    """
+    Returns a vendor string for a MAC (OUI). Tries a few common files and caches results.
+    """
+    if not mac or mac.lower() in ("unknown", "none"):
         return "unknown vendor"
 
-    try:
+    mac = mac.strip()
+    # normalize to XX:YY:ZZ:...
+    if len(mac) >= 8:
         oui = mac[:8].replace(":", "").upper()
-        line = run(f"grep -i {oui} /usr/share/hwdata/oui.txt | head -n1")
-        return line.strip() if line else "unknown vendor"
-    except:
+    else:
         return "unknown vendor"
+
+    if oui in _VENDOR_CACHE:
+        return _VENDOR_CACHE[oui]
+
+    # attempt to find a vendor by searching common files
+    vendor = "unknown vendor"
+    quoted = shlex.quote(oui)
+    for path in _POSSIBLE_OUI_PATHS:
+        if not os.path.exists(path):
+            continue
+        # match beginning of line containing the OUI (case-insensitive)
+        # use awk to produce the whole matching line
+        cmd = f"awk 'BEGIN{{IGNORECASE=1}} $0 ~ /{oui}/ {{print; exit}}' {shlex.quote(path)}"
+        out = run(cmd)
+        if out:
+            vendor = out.strip()
+            break
+
+    _VENDOR_CACHE[oui] = vendor
+    return vendor
 
 
 # load memory JSON
@@ -88,8 +122,8 @@ def update_memory(memory, devices):
             entry["last_seen"] = now
             entry["last_ip"] = ip
 
-            if ip not in entry["ips_seen"]:
-                entry["ips_seen"].append(ip)
+            if ip not in entry.get("ips_seen", []):
+                entry.setdefault("ips_seen", []).append(ip)
 
             entry["seen_count"] = entry.get("seen_count", 0) + 1
 
@@ -109,15 +143,11 @@ def annotate_devices_with_new_flag(devices, new_macs):
 
 
 # return a list of memory entries that were NOT present in this scan.
-
-
 def find_offline_devices(memory, devices):
-
     offline = []
-
     # Current MACs seen
     current_macs = {dev.get("mac") for dev in devices.values() if dev.get("mac")}
-
     for mac, entry in memory.items():
         if mac not in current_macs:
             offline.append(entry)
+    return offline

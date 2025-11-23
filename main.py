@@ -1,5 +1,6 @@
 import time
 import subprocess
+import re
 
 from json_memory import (
     load_memory,
@@ -7,6 +8,15 @@ from json_memory import (
     update_memory,
     annotate_devices_with_new_flag,
     find_offline_devices,
+    lookup_vendor,
+)
+
+# NEW: import classification helpers
+from extras import (
+    normalize_mac,
+    is_random_mac,
+    classify_device,
+    detect_zone,
 )
 
 
@@ -17,7 +27,9 @@ def run(cmd: str) -> str:
         return ""
 
 
-# 1) Load fping (ICMP) results
+# ==========================
+#       1. LOAD PING DATA
+# ==========================
 
 ping_ips = set()
 try:
@@ -30,64 +42,60 @@ except FileNotFoundError:
     pass
 
 
-# 2) Parse ARP table (ip neigh)
+# ==========================
+#        2. PARSE ARP
+# ==========================
+
 arp_raw = run("ip neigh")
 arp_entries = {}  # ip → { ip, mac, state }
 
 if arp_raw:
     for line in arp_raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # IPv4 only
+        m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+        if not m:
+            continue
+
+        ip = m.group(1)
+        if "FAILED" in line:
+            continue
+
         parts = line.split()
-        if not parts:
-            continue
-
-        ip = parts[0]
-
-        # Skip IPv6
-        if ":" in ip:
-            continue
-
-        # Skip entries like:
-        # "FAILED"
-        if parts[-1] == "FAILED":
-            continue
-
-        # Look for MAC
         mac = None
+
         if "lladdr" in parts:
             idx = parts.index("lladdr")
             if idx + 1 < len(parts):
-                mac = parts[idx + 1]
+                mac = normalize_mac(parts[idx + 1])
 
-        # ARP CHECKS (IMPORTANT)
-
-        # Skip entries with no MAC → hotspot fake ARP
-        if mac is None:
+        if mac is None or mac == "unknown":
             continue
 
-        # Skip placeholder MACs
-        if mac.lower() in ["00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"]:
-            continue
+        state = parts[-1].upper() if parts else "UNKNOWN"
 
-        # If passed all filters -> real device
-        state = parts[-1]
         arp_entries[ip] = {"ip": ip, "mac": mac, "state": state}
 
 
-# 3) Merge into device table
+# ==========================
+#      3. MERGE DEVICES
+# ==========================
+
 devices = {}
-# structure:
-# devices[ip] = {
-#   "ip": ...,
-#   "sources": {"PING","ARP"},
-#   "mac": ...,
-#   "arp_state": ...
-# }
 
-# add ping-only entries
+# PING-only
 for ip in ping_ips:
-    devices[ip] = {"ip": ip, "sources": {"PING"}, "mac": None, "arp_state": None}
+    devices[ip] = {
+        "ip": ip,
+        "sources": {"PING"},
+        "mac": None,
+        "arp_state": None,
+    }
 
-# merge ARP
+# Merge ARP
 for ip, info in arp_entries.items():
     if ip in devices:
         devices[ip]["sources"].add("ARP")
@@ -101,8 +109,8 @@ for ip, info in arp_entries.items():
             "arp_state": info["state"],
         }
 
-# Memory integration
 
+# MEMORY
 memory = load_memory()
 memory, new_macs = update_memory(memory, devices)
 save_memory(memory)
@@ -110,20 +118,23 @@ devices = annotate_devices_with_new_flag(devices, new_macs)
 offline_devices = find_offline_devices(memory, devices)
 
 
-# 4) Gateway / your IP / WiFi info
+# ==========================
+#   4. GATEWAY / YOUR IP
+# ==========================
+
 gw_ip = "unknown"
 gw_mac = "unknown"
 gw_vendor = "unknown vendor"
 
-# gateway IP
 gw_line = run("ip route | grep default | head -n1")
 if gw_line:
-    try:
-        gw_ip = gw_line.split()[2]
-    except:
-        pass
+    parts = gw_line.split()
+    if "via" in parts:
+        gw_ip = parts[parts.index("via") + 1]
+    else:
+        gw_ip = parts[2]
 
-# gateway MAC + vendor
+# gateway MAC
 if gw_ip != "unknown":
     neigh = run(f"ip neigh | grep '^{gw_ip} ' | head -n1")
     if neigh:
@@ -131,113 +142,120 @@ if gw_ip != "unknown":
         if "lladdr" in parts:
             idx = parts.index("lladdr")
             if idx + 1 < len(parts):
-                gw_mac = parts[idx + 1]
+                gw_mac = normalize_mac(parts[idx + 1])
+                gw_vendor = lookup_vendor(gw_mac)
 
-        # vendor lookup
-        try:
-            oui = gw_mac[:8].replace(":", "").upper()
-            line = run(f"grep -i {oui} /usr/share/hwdata/oui.txt | head -n1")
-            if line:
-                gw_vendor = line.strip()
-        except:
-            pass
 
-# Your IP
-my_ip = run("ip route get 1.1.1.1 | awk '{print $7}'")
+# MY IP
+my_ip = ""
+out = run("ip route get 1.1.1.1 2>/dev/null")
+m = re.search(r"\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b", out)
+if m:
+    my_ip = m.group(1)
+
 my_subnet = ".".join(my_ip.split(".")[:3]) if my_ip else "unknown"
 
-# WiFi info
+
+# ==========================
+#     5. WIFI DETECTION
+# ==========================
+
 ssid = ""
 bssid = ""
 
-iw = run("iw dev wlan0 link")
-for line in iw.splitlines():
-    line = line.strip()
-    if line.startswith("SSID:"):
-        ssid = line.split("SSID:")[1].strip()
-    elif line.startswith("Connected to"):
-        parts = line.split()
-        if len(parts) >= 3:
-            bssid = parts[2]
+iw_out = run("iw dev 2>/dev/null")
+wifi_iface = None
+
+if iw_out:
+    m = re.search(r"Interface\s+(\S+)", iw_out)
+    if m:
+        wifi_iface = m.group(1)
+
+if wifi_iface:
+    iw_link = run(f"iw dev {wifi_iface} link")
+    for line in iw_link.splitlines():
+        line = line.strip()
+        if line.startswith("SSID:"):
+            ssid = line.split("SSID:")[1].strip()
+        elif line.startswith("Connected to"):
+            bssid = normalize_mac(line.split()[2])
 
 
-# 5) Group devices by /24 subnet
-groups = {}  # subnet → list of device dicts
+# ==========================
+#   6. SUBNET GROUPING
+# ==========================
 
+groups = {}
 for ip, dev in devices.items():
     parts = ip.split(".")
     if len(parts) != 4:
         continue
 
     subnet = ".".join(parts[:3])
-
-    if subnet not in groups:
-        groups[subnet] = []
-
-    groups[subnet].append(dev)
+    groups.setdefault(subnet, []).append(dev)
 
 
-# 6) Ping helper for latency
+# latency test
 def ping_latency(ip: str):
     out = run(f"ping -c1 -W1 {ip}")
     if not out:
         return None
-    for line in out.splitlines():
-        if "time=" in line:
-            try:
-                val = line.split("time=")[1].split()[0]
-                return float(val)
-            except:
-                return None
-    return None
+    m = re.search(r"time=(\d+\.\d+)", out)
+    return float(m.group(1)) if m else None
 
 
-# 7) Print header
+# ==========================
+#         7. HEADER
+# ==========================
+
 print("\n[ YOU ]")
-print(f" ├── Your IP: {my_ip}")
+print(f" ├── Your IP: {my_ip or 'unknown'}")
 print(f" ├── Your Subnet: {my_subnet}.x")
 print(f" ├── Connected SSID: {ssid or 'unknown'}")
 print(f" ├── Access Point (BSSID): {bssid or 'unknown'}")
 print(f" └── Gateway: {gw_ip}  (MAC: {gw_mac}, Vendor: {gw_vendor})\n")
 
 
-# 8) Print tree per subnet
+# ==========================
+#     8. PRINT TREE
+# ==========================
+
 for subnet, dev_list in groups.items():
     count = len(dev_list)
     percent = round((count / 256) * 100, 2)
+    zone = detect_zone(dev_list)
 
-    if count < 3:
-        tag = "  (Sparse)"
-    elif count > 80:
-        tag = "  (Heavy)"
-    else:
-        tag = ""
+    tag = {
+        count < 3: "  (Sparse)",
+        count > 80: "  (Heavy)",
+    }.get(True, "")
 
     subnet_mark = "  <== YOUR SUBNET" if subnet == my_subnet else ""
 
-    print(f"     ├── {subnet}.x  ({count} hosts, {percent}% used){tag}{subnet_mark}")
+    print(
+        f"     ├── {subnet}.x  ({count} hosts, {percent}% used) [{zone}]{tag}{subnet_mark}"
+    )
 
-    # choose a device with PING source to measure subnet latency
-    sample = None
-    for d in dev_list:
-        if "PING" in d["sources"]:
-            sample = d["ip"]
-            break
-    if sample is None:
-        sample = dev_list[0]["ip"]
-
+    # latency sample
+    sample = next(
+        (d["ip"] for d in dev_list if "PING" in d["sources"]), dev_list[0]["ip"]
+    )
     latency = ping_latency(sample)
     if latency is not None:
         print(f"     │    Avg latency (sample {sample}): {latency} ms")
 
-    # sort numerically by host octet
+    # sort devices
     dev_list_sorted = sorted(dev_list, key=lambda d: int(d["ip"].split(".")[3]))
 
     for dev in dev_list_sorted:
         ip = dev["ip"]
-        mac = dev["mac"] or "unknown"
-        srcs = dev["sources"]
+        mac = normalize_mac(dev["mac"] or "unknown")
+        vendor = memory.get(mac, {}).get("vendor", "unknown vendor")
 
+        random_flag = is_random_mac(mac)
+        device_type = classify_device(mac, vendor, random_flag)
+
+        srcs = dev["sources"]
         if srcs == {"PING"}:
             src_label = "PING"
         elif srcs == {"ARP"}:
@@ -246,18 +264,19 @@ for subnet, dev_list in groups.items():
             src_label = "PING+ARP"
 
         you = "  (YOU)" if ip == my_ip else ""
-
         new_tag = "  (NEW)" if dev.get("is_new") else ""
-
-        vendor = memory.get(mac, {}).get("vendor", "unknown vendor")
+        rand = " (Random)" if random_flag else ""
 
         print(
             f"     │\n"
-            f"     │  └── {ip} [src={src_label}, mac={mac}, vendor={vendor}]{you}{new_tag}"
+            f"     │  └── {ip} [src={src_label}, mac={mac}, vendor={vendor}, type={device_type}{rand}]{you}{new_tag}"
         )
 
 
-# 9) Summary
+# ==========================
+#         9. SUMMARY
+# ==========================
+
 total_hosts = len(devices)
 total_subnets = len(groups)
 
@@ -272,15 +291,15 @@ if offline_devices:
     print(" Offline devices:")
     for entry in offline_devices:
         last_ip = entry.get("last_ip", "unknown")
-        vendor = entry.get("vendor", "unknown")
+        vendor = entry.get("vendor", "unknown vendor")
         mac = entry.get("mac", "unknown")
         last_seen = entry.get("last_seen", 0)
         age_min = int((time.time() - last_seen) / 60)
 
         print(
+            f"  |\n"
             f"  └── {last_ip}  [MAC={mac}, vendor={vendor}, offline {age_min} min ago]"
         )
-
     print("----------------------------\n")
 else:
     print(" No offline devices.")
