@@ -59,4 +59,5 @@ echo "[*] fping done. Time taken: ${fping_time} ms"
 
 # 5) Export interface for the Python script (optional) and call Python
 export INTERFACE="$interface"
-python3 ~/networktree/main.py
+cd ~/networking/projects/
+python3 ./networktree/main.py
